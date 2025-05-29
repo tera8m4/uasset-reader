@@ -1,6 +1,8 @@
+mod export_table;
 mod parser;
+mod unreal_types;
 
-use crate::parser::{print_asset_data, ParseError, UassetParser};
+use crate::parser::{ParseError, UassetParser, print_asset_data};
 use std::fs::File;
 use std::io::BufReader;
 
@@ -42,3 +44,4 @@ fn main() -> Result<(), ParseError> {
 byteorder = "1.5"
 thiserror = "1.0"
 */
+

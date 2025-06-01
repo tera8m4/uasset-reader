@@ -1,178 +1,14 @@
 use byteorder::{LittleEndian, ReadBytesExt};
-use std::collections::HashMap;
-use std::io;
 use std::io::{Read, Seek, SeekFrom};
-use thiserror::Error;
 
+use crate::asset_registry::{AssetData, AssetRegistryData};
+use crate::errors::ParseError;
+use crate::errors::Result;
 use crate::export_table::ExportEntry;
-use crate::parser::EUnrealEngineObjectUE5Version::{OptionalResources, RemoveObjectExportPackageGuid, TrackObjectExportIsInherited};
+use crate::reader::UassetReader;
+use crate::summary::UassetSummary;
 use crate::unreal_types::FName;
-
-#[derive(Error, Debug)]
-pub enum ParseError {
-    #[error("IO error: {0}")]
-    Io(#[from] io::Error),
-
-    #[error("Invalid uasset tag")]
-    InvalidTag,
-
-    #[error("Unsupported legacy file version: {0}")]
-    UnsupportedLegacyVersion(i32),
-
-    #[error("Invalid file offset: {offset} (file size: {file_size})")]
-    InvalidFileOffset { offset: i64, file_size: u64 },
-
-    #[error("Invalid array size: {0}")]
-    InvalidArraySize(i32),
-
-    #[error("Invalid compression flags")]
-    InvalidCompressionFlags,
-
-    #[error("Compressed chunks not supported")]
-    CompressedChunksNotSupported,
-
-    #[error("Unversioned asset parsing not allowed")]
-    UnversionedAssetNotAllowed,
-
-    #[error("Asset version too old: {major}.{minor} (minimum: 4.27)")]
-    AssetVersionTooOld { major: u16, minor: u16 },
-
-    #[error("Invalid UTF-8 string")]
-    InvalidUtf8(#[from] std::string::FromUtf8Error),
-
-    #[error("Invalid UTF-16 string")]
-    InvalidUtf16,
-}
-
-type Result<T> = std::result::Result<T, ParseError>;
-
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum EUnrealEngineObjectUE5Version {
-    InitialVersion = 1000,
-
-    // Support stripping names that are not referenced from export data
-    NamesReferencedFromExportData,
-
-    // Added a payload table of contents to the package summary
-    PayloadToc,
-
-    // Added data to identify references from and to optional package
-    OptionalResources,
-
-    // Large world coordinates converts a number of core types to double components by default.
-    LargeWorldCoordinates,
-
-    // Remove package GUID from FObjectExport
-    RemoveObjectExportPackageGuid,
-
-    // Add IsInherited to the FObjectExport entry
-    TrackObjectExportIsInherited,
-
-    // Replace FName asset path in FSoftObjectPath with (package name, asset name) pair FTopLevelAssetPath
-    FSoftObjectPathRemoveAssetPathFNames,
-
-    // Add a soft object path list to the package summary for fast remap
-    AddSoftObjectPathList,
-
-    // Added bulk/data resource table
-    DataResources,
-
-    // Added script property serialization offset to export table entries for saved, versioned packages
-    ScriptSerializationOffset,
-
-    // Adding property tag extension,
-    // Support for overridable serialization on UObject,
-    // Support for overridable logic in containers
-    PropertyTagExtensionAndOverridableSerialization,
-
-    // Added property tag complete type name and serialization type
-    PropertyTagCompleteTypeName,
-
-    // Changed UE::AssetRegistry::WritePackageData to include PackageBuildDependencies
-    AssetRegistryPackageBuildDependencies,
-
-    // Added meta data serialization offset to for saved, versioned packages
-    MetadataSerializationOffset,
-
-    // Added VCells to the object graph
-    VerseCells,
-
-    // Changed PackageFileSummary to write FIoHash PackageSavedHash instead of FGuid Guid
-    PackageSavedHash,
-
-    // OS shadow serialization of subobjects
-    OsSubObjectShadowSerialization,
-}
-
-#[derive(Debug, Default)]
-pub struct UassetSummary {
-    pub tag: u32,
-    pub legacy_file_version: i32,
-    pub legacy_ue3_version: i32,
-    pub file_version_ue4: i32,
-    pub file_version_ue5: i32,
-    pub file_version_licensee_ue4: u32,
-    pub saved_hash: Option<[u8; 20]>,
-    pub total_header_size: i32,
-    pub custom_versions: Vec<[u8; 20]>,
-    pub package_name: String,
-    pub package_flags: u32,
-    pub name_count: i32,
-    pub name_offset: i32,
-    pub soft_object_paths_count: Option<i32>,
-    pub soft_object_paths_offset: Option<i32>,
-    pub localization_id: String,
-    pub gatherable_text_data_count: i32,
-    pub gatherable_text_data_offset: i32,
-    pub export_count: i32,
-    pub export_offset: i32,
-    pub import_count: i32,
-    pub import_offset: i32,
-    pub cell_export_count: Option<i32>,
-    pub cell_export_offset: Option<i32>,
-    pub cell_import_count: Option<i32>,
-    pub cell_import_offset: Option<i32>,
-    pub metadata_offset: Option<i32>,
-    pub depends_offset: i32,
-    pub soft_package_references_count: i32,
-    pub soft_package_references_offset: i32,
-    pub searchable_names_offset: i32,
-    pub thumbnail_table_offset: i32,
-    pub guid: Option<[u8; 16]>,
-    pub persistent_guid: [u8; 16],
-    pub generations: Vec<[u8; 8]>,
-    pub saved_by_engine_version_major: u16,
-    pub saved_by_engine_version_minor: u16,
-    pub saved_by_engine_version_patch: u16,
-    pub saved_by_engine_version_changelist: u32,
-    pub saved_by_engine_version_name: String,
-    pub compatible_engine_version_major: u16,
-    pub compatible_engine_version_minor: u16,
-    pub compatible_engine_version_patch: u16,
-    pub compatible_engine_version_changelist: u32,
-    pub compatible_engine_version_name: String,
-    pub compression_flags: u32,
-    pub compressed_chunks: Vec<[u8; 16]>,
-    pub package_source: u32,
-    pub additional_packages_to_cook: Vec<String>,
-    pub asset_registry_data_offset: i32,
-    pub bulk_data_start_offset: i64,
-}
-
-#[derive(Debug, Default)]
-pub struct AssetRegistryData {
-    pub object_path: String,
-    pub object_class_name: String,
-    pub tags: HashMap<String, String>,
-}
-
-#[derive(Debug, Default)]
-pub struct AssetData {
-    pub asset_class_name: String,
-    pub object_path_without_package_name: String,
-    pub file_offset: i32,
-}
+use crate::versions::EUnrealEngineObjectUE5Version;
 
 pub struct UassetParser<R: Read + Seek> {
     reader: R,
@@ -226,88 +62,9 @@ impl<R: Read + Seek> UassetParser<R> {
         Ok(self.thumbnail_cache.as_ref().unwrap())
     }
 
-    fn read_fname(&mut self) -> Result<FName> {
-        let index = self.reader.read_i32::<LittleEndian>()?;
-        let number = self.reader.read_i32::<LittleEndian>()?;
-
-        Ok(FName { index, number })
+    pub fn get_exports(&self) -> &Vec<ExportEntry> {
+        &self.export
     }
-
-    fn read_fstring(&mut self) -> Result<String> {
-        let size = self.reader.read_i32::<LittleEndian>()?;
-
-        if size == 0 {
-            return Ok(String::new());
-        }
-
-        let (load_ucs2_char, actual_size) = if size < 0 {
-            (true, (-size) as usize)
-        } else {
-            (false, size as usize)
-        };
-
-        let byte_size = if load_ucs2_char {
-            actual_size * 2
-        } else {
-            actual_size
-        };
-
-        let mut buffer = vec![0u8; byte_size];
-        self.reader.read_exact(&mut buffer)?;
-
-        // Remove null terminator
-        if load_ucs2_char {
-            buffer.truncate(byte_size - 2);
-            // Convert UTF-16LE to String
-            let u16_vec: Vec<u16> = buffer
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-                .collect();
-            String::from_utf16(&u16_vec).map_err(|_| ParseError::InvalidUtf16)
-        } else {
-            buffer.truncate(byte_size - 1);
-            String::from_utf8(buffer).map_err(|e| e.into())
-        }
-    }
-
-    fn skip_bytes(&mut self, n: i64) -> Result<()> {
-        self.reader.seek(SeekFrom::Current(n))?;
-        Ok(())
-    }
-
-    // fn skip_tarray(&mut self, type_size: usize, max_elements: usize) -> Result<()> {
-    //     let n = self.reader.read_i32::<LittleEndian>()?;
-    //
-    //     if n < 0 || n as usize > max_elements {
-    //         return Err(ParseError::InvalidArraySize(n));
-    //     }
-    //
-    //     self.skip_bytes((n as usize * type_size) as i64)?;
-    //     Ok(())
-    // }
-
-    fn read_tarray<T, F>(&mut self, mut reader_fn: F, max_elements: usize) -> Result<Vec<T>>
-    where
-        F: FnMut(&mut Self) -> Result<T>,
-    {
-        let n = self.reader.read_i32::<LittleEndian>()?;
-
-        if n < 0 || n as usize > max_elements {
-            return Err(ParseError::InvalidArraySize(n));
-        }
-
-        let mut array = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            array.push(reader_fn(self)?);
-        }
-        Ok(array)
-    }
-
-    // fn read_byte_array(&mut self, size: usize) -> Result<Vec<u8>> {
-    //     let mut buffer = vec![0u8; size];
-    //     self.reader.read_exact(&mut buffer)?;
-    //     Ok(buffer)
-    // }
 
     fn check_file_offset(&self, offset: i64) -> Result<()> {
         if offset < 0 || offset as u64 > self.package_file_size {
@@ -389,10 +146,10 @@ impl<R: Read + Seek> UassetParser<R> {
             s.total_header_size = self.reader.read_i32::<LittleEndian>()?;
         }
 
-        s.custom_versions = self.read_tarray(
-            |parser| {
+        s.custom_versions = self.reader.read_tarray(
+            |reader| {
                 let mut buf = [0u8; 20];
-                parser.reader.read_exact(&mut buf)?;
+                reader.read_exact(&mut buf)?;
                 Ok(buf)
             },
             100000,
@@ -402,7 +159,7 @@ impl<R: Read + Seek> UassetParser<R> {
             s.total_header_size = self.reader.read_i32::<LittleEndian>()?;
         }
 
-        s.package_name = self.read_fstring()?;
+        s.package_name = self.reader.read_fstring()?;
         s.package_flags = self.reader.read_u32::<LittleEndian>()?;
         s.name_count = self.reader.read_i32::<LittleEndian>()?;
         s.name_offset = self.reader.read_i32::<LittleEndian>()?;
@@ -412,7 +169,7 @@ impl<R: Read + Seek> UassetParser<R> {
             s.soft_object_paths_offset = Some(self.reader.read_i32::<LittleEndian>()?);
         }
 
-        s.localization_id = self.read_fstring()?;
+        s.localization_id = self.reader.read_fstring()?;
 
         s.gatherable_text_data_count = self.reader.read_i32::<LittleEndian>()?;
         s.gatherable_text_data_offset = self.reader.read_i32::<LittleEndian>()?;
@@ -460,10 +217,10 @@ impl<R: Read + Seek> UassetParser<R> {
         let remaining_bytes = (s.total_header_size as u64).saturating_sub(current_pos + 1);
         let max_generations = (remaining_bytes / 20) as usize;
 
-        s.generations = self.read_tarray(
-            |parser| {
+        s.generations = self.reader.read_tarray(
+            |reader| {
                 let mut buf = [0u8; 8];
-                parser.reader.read_exact(&mut buf)?;
+                reader.read_exact(&mut buf)?;
                 Ok(buf)
             },
             max_generations,
@@ -473,13 +230,13 @@ impl<R: Read + Seek> UassetParser<R> {
         s.saved_by_engine_version_minor = self.reader.read_u16::<LittleEndian>()?;
         s.saved_by_engine_version_patch = self.reader.read_u16::<LittleEndian>()?;
         s.saved_by_engine_version_changelist = self.reader.read_u32::<LittleEndian>()?;
-        s.saved_by_engine_version_name = self.read_fstring()?;
+        s.saved_by_engine_version_name = self.reader.read_fstring()?;
 
         s.compatible_engine_version_major = self.reader.read_u16::<LittleEndian>()?;
         s.compatible_engine_version_minor = self.reader.read_u16::<LittleEndian>()?;
         s.compatible_engine_version_patch = self.reader.read_u16::<LittleEndian>()?;
         s.compatible_engine_version_changelist = self.reader.read_u32::<LittleEndian>()?;
-        s.compatible_engine_version_name = self.read_fstring()?;
+        s.compatible_engine_version_name = self.reader.read_fstring()?;
 
         self.check_asset_version(
             s.saved_by_engine_version_major,
@@ -494,10 +251,10 @@ impl<R: Read + Seek> UassetParser<R> {
         let remaining_bytes = (s.total_header_size as u64).saturating_sub(current_pos + 1);
         let max_chunks = (remaining_bytes / 16) as usize;
 
-        s.compressed_chunks = self.read_tarray(
-            |parser| {
+        s.compressed_chunks = self.reader.read_tarray(
+            |reader| {
                 let mut buf = [0u8; 16];
-                parser.reader.read_exact(&mut buf)?;
+                reader.read_exact(&mut buf)?;
                 Ok(buf)
             },
             max_chunks,
@@ -512,8 +269,9 @@ impl<R: Read + Seek> UassetParser<R> {
         let current_pos = self.reader.stream_position()?;
         let remaining_bytes = (s.total_header_size as u64).saturating_sub(current_pos + 1);
 
-        s.additional_packages_to_cook =
-            self.read_tarray(|parser| parser.read_fstring(), remaining_bytes as usize)?;
+        s.additional_packages_to_cook = self
+            .reader
+            .read_tarray(|reader| reader.read_fstring(), remaining_bytes as usize)?;
 
         s.asset_registry_data_offset = self.reader.read_i32::<LittleEndian>()?;
         s.bulk_data_start_offset = self.reader.read_i64::<LittleEndian>()?;
@@ -539,8 +297,8 @@ impl<R: Read + Seek> UassetParser<R> {
         let mut names = Vec::with_capacity(self.summary.name_count as usize);
 
         for _ in 0..self.summary.name_count {
-            let name = self.read_fstring()?;
-            self.skip_bytes(4)?; // Skip precalculated hashes
+            let name = self.reader.read_fstring()?;
+            self.reader.skip_bytes(4)?; // Skip precalculated hashes
             names.push(name);
         }
 
@@ -569,13 +327,13 @@ impl<R: Read + Seek> UassetParser<R> {
 
         for _ in 0..n_assets {
             let mut asset = AssetRegistryData::default();
-            asset.object_path = self.read_fstring()?;
-            asset.object_class_name = self.read_fstring()?;
+            asset.object_path = self.reader.read_fstring()?;
+            asset.object_class_name = self.reader.read_fstring()?;
 
             let n_tags = self.reader.read_i32::<LittleEndian>()?;
 
             for _ in 0..n_tags {
-                match (self.read_fstring(), self.read_fstring()) {
+                match (self.reader.read_fstring(), self.reader.read_fstring()) {
                     (Ok(key), Ok(val)) => {
                         asset.tags.insert(key, val);
                     }
@@ -608,8 +366,8 @@ impl<R: Read + Seek> UassetParser<R> {
         for _ in 0..object_count {
             let mut asset_data = AssetData::default();
 
-            asset_data.asset_class_name = self.read_fstring()?;
-            asset_data.object_path_without_package_name = self.read_fstring()?;
+            asset_data.asset_class_name = self.reader.read_fstring()?;
+            asset_data.object_path_without_package_name = self.reader.read_fstring()?;
             asset_data.file_offset = self.reader.read_i32::<LittleEndian>()?;
 
             asset_data_list.push(asset_data);
@@ -634,7 +392,7 @@ impl<R: Read + Seek> UassetParser<R> {
             let super_index = self.reader.read_i32::<LittleEndian>()?;
             let template_index = self.reader.read_i32::<LittleEndian>()?;
             let outer_index = self.reader.read_i32::<LittleEndian>()?;
-            let object_name = self.read_fname()?;
+            let object_name = self.reader.read_fname()?;
             let object_flags: i32 = self.reader.read_i32::<LittleEndian>()?;
             let serial_size: i64 = self.reader.read_i64::<LittleEndian>()?;
             let serial_offset: i64 = self.reader.read_i64::<LittleEndian>()?;
@@ -643,24 +401,27 @@ impl<R: Read + Seek> UassetParser<R> {
             let not_for_client = self.reader.read_u32::<LittleEndian>()? != 0;
             let not_for_server = self.reader.read_u32::<LittleEndian>()? != 0;
 
-            if (self.summary.file_version_ue5 < RemoveObjectExportPackageGuid as i32)
+            if self.summary.file_version_ue5
+                < EUnrealEngineObjectUE5Version::RemoveObjectExportPackageGuid as i32
             {
                 self.reader.read_i128::<LittleEndian>()?;
             }
 
-            let is_inherited_instance = if (self.summary.file_version_ue5 > TrackObjectExportIsInherited as i32)
+            let is_inherited_instance = if self.summary.file_version_ue5
+                > EUnrealEngineObjectUE5Version::TrackObjectExportIsInherited as i32
             {
                 self.reader.read_u32::<LittleEndian>()? != 0
             } else {
                 false
             };
 
-
             let package_flags = self.reader.read_u32::<LittleEndian>()?;
             let not_always_loaded_for_editor_game = self.reader.read_u32::<LittleEndian>()? != 0;
             let is_asset = self.reader.read_u32::<LittleEndian>()? != 0;
 
-            let generate_public_hash = if self.summary.file_version_ue5 >= OptionalResources as i32 {
+            let generate_public_hash = if self.summary.file_version_ue5
+                >= EUnrealEngineObjectUE5Version::OptionalResources as i32
+            {
                 self.reader.read_u32::<LittleEndian>()? != 0
             } else {
                 false
@@ -769,4 +530,3 @@ pub fn print_asset_data(
 
     Ok(())
 }
-

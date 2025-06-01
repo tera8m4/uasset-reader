@@ -2,9 +2,11 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::asset_registry::{AssetData, AssetRegistryData};
+use crate::data_table::DataTableExport;
 use crate::errors::ParseError;
 use crate::errors::Result;
 use crate::export_table::ExportEntry;
+use crate::exports::ParsedExport;
 use crate::reader::UassetReader;
 use crate::summary::UassetSummary;
 use crate::unreal_types::FName;
@@ -15,10 +17,10 @@ pub struct UassetParser<R: Read + Seek> {
     package_file_size: u64,
     allow_unversioned: bool,
     pub summary: UassetSummary,
-    names: Option<Vec<String>>,
+    pub names: Option<Vec<String>>,
     asset_registry_data: Option<Vec<AssetRegistryData>>,
     thumbnail_cache: Option<Vec<AssetData>>,
-    export: Vec<ExportEntry>,
+    exports: Vec<ParsedExport>,
 }
 
 impl<R: Read + Seek> UassetParser<R> {
@@ -34,7 +36,7 @@ impl<R: Read + Seek> UassetParser<R> {
             names: None,
             asset_registry_data: None,
             thumbnail_cache: None,
-            export: vec![],
+            exports: vec![],
         };
 
         parser.summary = parser.read_uasset_summary()?;
@@ -62,8 +64,8 @@ impl<R: Read + Seek> UassetParser<R> {
         Ok(self.thumbnail_cache.as_ref().unwrap())
     }
 
-    pub fn get_exports(&self) -> &Vec<ExportEntry> {
-        &self.export
+    pub fn get_exports(&self) -> &Vec<ParsedExport> {
+        &self.exports
     }
 
     fn check_file_offset(&self, offset: i64) -> Result<()> {
@@ -376,157 +378,138 @@ impl<R: Read + Seek> UassetParser<R> {
         Ok(asset_data_list)
     }
 
-    fn read_export(&mut self) -> Result<Vec<ExportEntry>> {
+    pub fn read_exports(&mut self) -> Result<()> {
         let offset = self.summary.export_offset;
         let count = self.summary.export_count;
 
         if offset <= 0 || offset as u64 > self.package_file_size || count <= 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
+        // First, read export entries
         let mut entries: Vec<ExportEntry> = vec![];
-
         self.reader.seek(SeekFrom::Start(offset as u64))?;
+
         for _ in 0..count {
-            let class_index = self.reader.read_i32::<LittleEndian>()?;
-            let super_index = self.reader.read_i32::<LittleEndian>()?;
-            let template_index = self.reader.read_i32::<LittleEndian>()?;
-            let outer_index = self.reader.read_i32::<LittleEndian>()?;
-            let object_name = self.reader.read_fname()?;
-            let object_flags: i32 = self.reader.read_i32::<LittleEndian>()?;
-            let serial_size: i64 = self.reader.read_i64::<LittleEndian>()?;
-            let serial_offset: i64 = self.reader.read_i64::<LittleEndian>()?;
-
-            let force_export = self.reader.read_u32::<LittleEndian>()? != 0;
-            let not_for_client = self.reader.read_u32::<LittleEndian>()? != 0;
-            let not_for_server = self.reader.read_u32::<LittleEndian>()? != 0;
-
-            if self.summary.file_version_ue5
-                < EUnrealEngineObjectUE5Version::RemoveObjectExportPackageGuid as i32
-            {
-                self.reader.read_i128::<LittleEndian>()?;
-            }
-
-            let is_inherited_instance = if self.summary.file_version_ue5
-                > EUnrealEngineObjectUE5Version::TrackObjectExportIsInherited as i32
-            {
-                self.reader.read_u32::<LittleEndian>()? != 0
-            } else {
-                false
-            };
-
-            let package_flags = self.reader.read_u32::<LittleEndian>()?;
-            let not_always_loaded_for_editor_game = self.reader.read_u32::<LittleEndian>()? != 0;
-            let is_asset = self.reader.read_u32::<LittleEndian>()? != 0;
-
-            let generate_public_hash = if self.summary.file_version_ue5
-                >= EUnrealEngineObjectUE5Version::OptionalResources as i32
-            {
-                self.reader.read_u32::<LittleEndian>()? != 0
-            } else {
-                false
-            };
-
-            let first_export_dependency = self.reader.read_i32::<LittleEndian>()?;
-            let serialization_before_serialization_dependencies =
-                self.reader.read_i32::<LittleEndian>()?;
-            let create_before_serialization_dependencies =
-                self.reader.read_i32::<LittleEndian>()?;
-            let serialization_before_create_dependencies =
-                self.reader.read_i32::<LittleEndian>()?;
-            let create_before_create_dependencies = self.reader.read_i32::<LittleEndian>()?;
-
-            let script_serialization_start_offset = self.reader.read_i64::<LittleEndian>()?;
-            let script_serialization_end_offset = self.reader.read_i64::<LittleEndian>()?;
-
-            let entry = ExportEntry {
-                class_index,
-                super_index,
-                template_index,
-                outer_index,
-                object_name,
-                object_flags,
-                serial_size,
-                serial_offset,
-                force_export,
-                not_for_client,
-                not_for_server,
-                is_inherited_instance,
-                package_flags,
-                not_always_loaded_for_editor_game,
-                is_asset,
-                generate_public_hash,
-                first_export_dependency,
-                serialization_before_serialization_dependencies,
-                create_before_serialization_dependencies,
-                serialization_before_create_dependencies,
-                create_before_create_dependencies,
-                script_serialization_start_offset,
-                script_serialization_end_offset,
-            };
-
+            let entry = self.read_export_entry()?;
             entries.push(entry);
         }
 
-        Ok(entries)
+        // Get names for determining export types
+        let names = &self.names.as_ref().unwrap();
+
+        // Now read the actual export data for each entry
+        for entry in entries {
+            self.reader
+                .seek(SeekFrom::Start(entry.serial_offset as u64))?;
+
+            // Determine export class type from the entry
+            let export_class_type = self.get_export_class_type(&entry, &names);
+            println!("{export_class_type}");
+
+            let parsed_export = if export_class_type.ends_with("DataTable")
+                || export_class_type.starts_with("DT_")
+            {
+                // Read as DataTable
+                let mut data_table = DataTableExport::new();
+                data_table.read(&mut self.reader, &names)?;
+                ParsedExport::new_data_table(entry, data_table)
+            } else {
+                // Read as raw data for other export types
+                let mut data = vec![0u8; entry.serial_size as usize];
+                self.reader.read_exact(&mut data)?;
+                ParsedExport::new_normal(entry, data)
+            };
+
+            self.exports.push(parsed_export);
+        }
+
+        Ok(())
     }
-}
 
-pub fn print_asset_data(
-    parser: &mut UassetParser<impl Read + Seek>,
-    show_asset_registry: bool,
-    show_tags: bool,
-    show_names: bool,
-    show_thumbnail_cache: bool,
-) -> Result<()> {
-    // Print summary
-    println!("{:#?}", parser.summary);
+    fn read_export_entry(&mut self) -> Result<ExportEntry> {
+        use crate::versions::EUnrealEngineObjectUE5Version::{
+            OptionalResources, RemoveObjectExportPackageGuid, TrackObjectExportIsInherited,
+        };
 
-    if show_asset_registry {
-        let registry_data = parser.get_asset_registry_data()?;
-        for (idx, asset_data) in registry_data.iter().enumerate() {
-            println!("\nAssetData {}\n", idx);
-            println!("ObjectPath     : {}", asset_data.object_path);
-            println!("ObjectClassName: {}", asset_data.object_class_name);
+        let class_index = self.reader.read_i32::<LittleEndian>()?;
+        let super_index = self.reader.read_i32::<LittleEndian>()?;
+        let template_index = self.reader.read_i32::<LittleEndian>()?;
+        let outer_index = self.reader.read_i32::<LittleEndian>()?;
+        let object_name = self.reader.read_fname()?;
+        let object_flags = self.reader.read_i32::<LittleEndian>()?;
+        let serial_size = self.reader.read_i64::<LittleEndian>()?;
+        let serial_offset = self.reader.read_i64::<LittleEndian>()?;
 
-            if show_tags {
-                println!("Tags");
-                for (k, v) in &asset_data.tags {
-                    println!("Tag {}: {}", k, v);
-                }
-            }
+        let force_export = self.reader.read_u32::<LittleEndian>()? != 0;
+        let not_for_client = self.reader.read_u32::<LittleEndian>()? != 0;
+        let not_for_server = self.reader.read_u32::<LittleEndian>()? != 0;
+
+        if self.summary.file_version_ue5 < RemoveObjectExportPackageGuid as i32 {
+            self.reader.read_i128::<LittleEndian>()?; // Skip package GUID
+        }
+
+        let is_inherited_instance =
+            if self.summary.file_version_ue5 > TrackObjectExportIsInherited as i32 {
+                self.reader.read_u32::<LittleEndian>()? != 0
+            } else {
+                false
+            };
+
+        let package_flags = self.reader.read_u32::<LittleEndian>()?;
+        let not_always_loaded_for_editor_game = self.reader.read_u32::<LittleEndian>()? != 0;
+        let is_asset = self.reader.read_u32::<LittleEndian>()? != 0;
+
+        let generate_public_hash = if self.summary.file_version_ue5 >= OptionalResources as i32 {
+            self.reader.read_u32::<LittleEndian>()? != 0
+        } else {
+            false
+        };
+
+        let first_export_dependency = self.reader.read_i32::<LittleEndian>()?;
+        let serialization_before_serialization_dependencies =
+            self.reader.read_i32::<LittleEndian>()?;
+        let create_before_serialization_dependencies = self.reader.read_i32::<LittleEndian>()?;
+        let serialization_before_create_dependencies = self.reader.read_i32::<LittleEndian>()?;
+        let create_before_create_dependencies = self.reader.read_i32::<LittleEndian>()?;
+
+        let script_serialization_start_offset = self.reader.read_i64::<LittleEndian>()?;
+        let script_serialization_end_offset = self.reader.read_i64::<LittleEndian>()?;
+
+        Ok(ExportEntry {
+            class_index,
+            super_index,
+            template_index,
+            outer_index,
+            object_name,
+            object_flags,
+            serial_size,
+            serial_offset,
+            force_export,
+            not_for_client,
+            not_for_server,
+            is_inherited_instance,
+            package_flags,
+            not_always_loaded_for_editor_game,
+            is_asset,
+            generate_public_hash,
+            first_export_dependency,
+            serialization_before_serialization_dependencies,
+            create_before_serialization_dependencies,
+            serialization_before_create_dependencies,
+            create_before_create_dependencies,
+            script_serialization_start_offset,
+            script_serialization_end_offset,
+        })
+    }
+
+    fn get_export_class_type(&self, entry: &ExportEntry, names: &[String]) -> String {
+        // This is a simplified version - in a full implementation you'd need to
+        // resolve import/export references to get the actual class type
+        if entry.object_name.index >= 0 && (entry.object_name.index as usize) < names.len() {
+            names[entry.object_name.index as usize].clone()
+        } else {
+            "Unknown".to_string()
         }
     }
-
-    if show_names {
-        println!("\nNames\n");
-        let names = parser.get_names()?;
-        for (idx, name) in names.iter().enumerate() {
-            println!("Name {}: {}", idx, name);
-        }
-    }
-
-    if show_thumbnail_cache {
-        println!("\nThumbnailCache");
-        let cache = parser.get_thumbnail_cache()?;
-        for asset_data in cache {
-            println!();
-            println!(
-                "AssetClassName              : {}",
-                asset_data.asset_class_name
-            );
-            println!(
-                "ObjectPathWithoutPackageName: {}",
-                asset_data.object_path_without_package_name
-            );
-            println!("FileOffset                  : {}", asset_data.file_offset);
-        }
-    }
-
-    let exports = parser.read_export().unwrap();
-    for export in exports {
-        println!("Export: {export:?}");
-    }
-
-    Ok(())
 }

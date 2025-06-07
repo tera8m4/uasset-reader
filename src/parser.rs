@@ -305,6 +305,16 @@ impl<R: Read + Seek> UassetParser<R> {
         Ok(names)
     }
 
+    fn read_fname(&mut self) -> Option<String> {
+        let names = self.names.as_ref().unwrap();
+        let fname = self.reader.read_fname().unwrap();
+        if fname.is_none() {
+            None
+        } else {
+            Some(names[fname.index as usize].clone())
+        }
+    }
+
     fn read_asset_registry_data(&mut self) -> Result<Vec<AssetRegistryData>> {
         let offset = self.summary.asset_registry_data_offset;
 
@@ -524,9 +534,33 @@ pub fn print_asset_data(
     }
 
     let exports = parser.read_export().unwrap();
-    for export in exports {
+    for export in &exports {
         println!("Export: {export:?}");
     }
+
+    let data_table =&exports[1];
+
+    println!("{}", &data_table.serial_offset);
+    parser.reader.seek(SeekFrom::Start(data_table.serial_offset as u64))?;
+    let flags = parser.reader.read_u8()?;
+
+    loop {
+        let tag = parser.read_fname();
+        if tag.is_none() {
+            break
+        }
+        let type_name = parser.read_fname().unwrap();
+        let inner_count: i32 = parser.reader.read_i32::<LittleEndian>()?;
+
+        println!("Name: {} Type: {type_name:?} : {inner_count}", &tag.as_ref().unwrap());
+        let property_size = parser.reader.read_i32::<LittleEndian>()?;
+        let property_flags = parser.reader.read_u8()?;
+
+        let property_value = parser.reader.read_i32::<LittleEndian>()?;
+
+        println!("Property size: {property_size}. flags: {property_flags}");
+    }
+
 
     Ok(())
 }

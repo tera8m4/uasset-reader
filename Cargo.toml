@@ -8,7 +8,7 @@ name = "uasset_parser"
 path = "src/lib.rs"
 
 [[bin]]
-name = "uasset-cli"
+name = "uasset-reader"
 path = "src/main.rs"
 
 [dependencies]

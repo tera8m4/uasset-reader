@@ -308,11 +308,7 @@ impl<R: Read + Seek> UassetParser<R> {
     fn read_fname(&mut self) -> Option<String> {
         let names = self.names.as_ref().unwrap();
         let fname = self.reader.read_fname().unwrap();
-        if fname.is_none() {
-            None
-        } else {
-            Some(names[fname.index as usize].clone())
-        }
+        Some(names[fname.index as usize].clone())
     }
 
     fn read_asset_registry_data(&mut self) -> Result<Vec<AssetRegistryData>> {
@@ -545,21 +541,31 @@ pub fn print_asset_data(
     let flags = parser.reader.read_u8()?;
 
     loop {
-        let tag = parser.read_fname();
-        if tag.is_none() {
+        let tag = parser.read_fname().unwrap();
+        if tag == "None" {
             break
         }
-        let type_name = parser.read_fname().unwrap();
-        let inner_count: i32 = parser.reader.read_i32::<LittleEndian>()?;
+        let mut remaining = 1;
 
-        println!("Name: {} Type: {type_name:?} : {inner_count}", &tag.as_ref().unwrap());
+        while remaining > 0 {
+            let name = parser.read_fname().unwrap();
+            let inner_count = parser.reader.read_i32::<LittleEndian>()?;
+            remaining += inner_count - 1;
+        }
+
+        println!("Name: {}", &tag);
         let property_size = parser.reader.read_i32::<LittleEndian>()?;
         let property_flags = parser.reader.read_u8()?;
 
-        let property_value = parser.reader.read_i32::<LittleEndian>()?;
+        let property_value = parser.reader.skip_bytes(property_size as i64);
 
         println!("Property size: {property_size}. flags: {property_flags}");
     }
+
+    parser.reader.skip_bytes(4);
+
+    let rows = parser.reader.read_i32::<LittleEndian>()?;
+    println!("row: {rows}");
 
 
     Ok(())
